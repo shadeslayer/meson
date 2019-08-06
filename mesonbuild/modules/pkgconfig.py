@@ -260,7 +260,8 @@ class PkgConfigModule(ExtensionModule):
         return subdir
 
     def generate_pkgconfig_file(self, state, deps, subdirs, name, description,
-                                url, version, pcfile, conflicts, variables):
+                                url, version, pcfile, conflicts, variables,
+                                dataonly):
         deps.remove_dups()
         coredata = state.environment.get_coredata()
         outdir = state.environment.scratch_dir
@@ -270,9 +271,10 @@ class PkgConfigModule(ExtensionModule):
         libdir = PurePath(coredata.get_builtin_option('libdir'))
         incdir = PurePath(coredata.get_builtin_option('includedir'))
         with open(fname, 'w', encoding='utf-8') as ofile:
-            ofile.write('prefix={}\n'.format(self._escape(prefix)))
-            ofile.write('libdir={}\n'.format(self._escape('${prefix}' / libdir)))
-            ofile.write('includedir={}\n'.format(self._escape('${prefix}' / incdir)))
+            if not dataonly:
+                ofile.write('prefix={}\n'.format(self._escape(prefix)))
+                ofile.write('libdir={}\n'.format(self._escape('${prefix}' / libdir)))
+                ofile.write('includedir={}\n'.format(self._escape('${prefix}' / incdir)))
             if variables:
                 ofile.write('\n')
             for k, v in variables:
@@ -330,23 +332,24 @@ class PkgConfigModule(ExtensionModule):
                 ofile.write('Libs: {}\n'.format(' '.join(generate_libs_flags(deps.pub_libs))))
             if len(deps.priv_libs) > 0:
                 ofile.write('Libs.private: {}\n'.format(' '.join(generate_libs_flags(deps.priv_libs))))
-            ofile.write('Cflags:')
-            for h in subdirs:
-                ofile.write(' ')
-                if h == '.':
-                    ofile.write('-I${includedir}')
-                else:
-                    ofile.write(self._escape(PurePath('-I${includedir}') / h))
-            for f in deps.cflags:
-                ofile.write(' ')
-                ofile.write(self._escape(f))
-            ofile.write('\n')
+
+            def generate_compiler_flags(dirs):
+                cflags_buf = []
+                for f in deps.cflags:
+                    cflags_buf.append(self._escape(f))
+                return cflags_buf
+
+            cflags = generate_compiler_flags(subdirs)
+            if not dataonly and cflags:
+                ofile.write('Cflags: {}\n'.format(' '.join(cflags)))
 
     @FeatureNewKwargs('pkgconfig.generate', '0.42.0', ['extra_cflags'])
     @FeatureNewKwargs('pkgconfig.generate', '0.41.0', ['variables'])
+    @FeatureNewKwargs('pkgconfig.generate', '0.52.0', ['dataonly'])
     @permittedKwargs({'libraries', 'version', 'name', 'description', 'filebase',
                       'subdirs', 'requires', 'requires_private', 'libraries_private',
-                      'install_dir', 'extra_cflags', 'variables', 'url', 'd_module_versions'})
+                      'install_dir', 'extra_cflags', 'variables', 'url', 'd_module_versions',
+                      'dataonly'})
     def generate(self, state, args, kwargs):
         if 'variables' in kwargs:
             FeatureNew('custom pkgconfig variables', '0.41.0').use(state.subproject)
@@ -355,6 +358,7 @@ class PkgConfigModule(ExtensionModule):
         default_description = None
         default_name = None
         mainlib = None
+        default_subdirs = ['.']
         if not args and 'version' not in kwargs:
             FeatureNew('pkgconfig.generate implicit version keyword', '0.46.0').use(state.subproject)
         elif len(args) == 1:
@@ -370,7 +374,15 @@ class PkgConfigModule(ExtensionModule):
         elif len(args) > 1:
             raise mesonlib.MesonException('Too many positional arguments passed to Pkgconfig_gen.')
 
-        subdirs = mesonlib.stringlistify(kwargs.get('subdirs', ['.']))
+        dataonly = kwargs.get('dataonly', False)
+        if dataonly:
+            default_subdirs = []
+            blocked_vars = ['libraries', 'libraries_private', 'require_private', 'extra_cflags', 'subdirs']
+            for var in blocked_vars:
+                if len(kwargs.get(var, [])) > 0:
+                    raise mesonlib.MesonException('Cannot combine dataonly with any of {}'.format(blocked_vars))
+
+        subdirs = mesonlib.stringlistify(kwargs.get('subdirs', default_subdirs))
         version = kwargs.get('version', default_version)
         if not isinstance(version, str):
             raise mesonlib.MesonException('Version must be specified.')
@@ -396,6 +408,11 @@ class PkgConfigModule(ExtensionModule):
             libraries = [mainlib] + libraries
 
         deps = DependenciesHelper(filebase)
+        for d in subdirs:
+            if d == '.':
+                deps.add_cflags(['-I${includedir}'])
+            else:
+                deps.add_cflags(self._escape(PurePath('-I${includedir}') / d))
         deps.add_pub_libs(libraries)
         deps.add_priv_libs(kwargs.get('libraries_private', []))
         deps.add_pub_reqs(kwargs.get('requires', []))
@@ -408,7 +425,7 @@ class PkgConfigModule(ExtensionModule):
             if compiler:
                 deps.add_cflags(compiler.get_feature_args({'versions': dversions}, None))
 
-        def parse_variable_list(stringlist):
+        def parse_variable_list(stringlist, dataonly):
             reserved = ['prefix', 'libdir', 'includedir']
             variables = []
             for var in stringlist:
@@ -432,7 +449,8 @@ class PkgConfigModule(ExtensionModule):
 
             return variables
 
-        variables = parse_variable_list(mesonlib.stringlistify(kwargs.get('variables', [])))
+        variables = parse_variable_list(mesonlib.stringlistify(kwargs.get('variables', [])),
+                                        dataonly)
 
         pcfile = filebase + '.pc'
         pkgroot = kwargs.get('install_dir', default_install_dir)
@@ -441,7 +459,8 @@ class PkgConfigModule(ExtensionModule):
         if not isinstance(pkgroot, str):
             raise mesonlib.MesonException('Install_dir must be a string.')
         self.generate_pkgconfig_file(state, deps, subdirs, name, description, url,
-                                     version, pcfile, conflicts, variables)
+                                     version, pcfile, conflicts, variables,
+                                     dataonly)
         res = build.Data(mesonlib.File(True, state.environment.get_scratch_dir(), pcfile), pkgroot)
         # Associate the main library with this generated pc file. If the library
         # is used in any subsequent call to the generated, it will generate a
